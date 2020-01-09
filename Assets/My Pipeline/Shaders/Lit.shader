@@ -23,11 +23,37 @@
 			// 指定均匀缩放，这样实例化缓冲中不会包含从世界空间到对象空间的转换矩阵
 			#pragma instancing_options assumeuniformscaling
 
+			// 是否开启硬阴影
+			#pragma multi_compile _ _SHADOWS_HARD
+
+			// 是否开启软阴影
+			#pragma multi_compile _ _SHADOWS_SOFT
+
 			// 指定顶点着色器和片段着色器
 			#pragma vertex LitPassVertex
 			#pragma fragment LitPassFragment
 
 			#include "../ShaderLibrary/Lit.hlsl"
+
+			ENDHLSL
+		}
+
+		Pass {
+			Tags {
+				"LightMode" = "ShadowCaster"
+			}
+
+			HLSLPROGRAM
+
+			#pragma target 3.5
+
+			#pragma multi_compile_instancing
+			#pragma instancing_options assumeuniformscaling
+
+			#pragma vertex ShadowCasterPassVertex
+			#pragma fragment ShadowCasterPassFragment
+
+			#include "../ShaderLibrary/ShadowCaster.hlsl"
 
 			ENDHLSL
 		}

@@ -5,6 +5,7 @@
 #define MAX_VISIBLE_LIGHTS 16
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Shadow/ShadowSamplingTent.hlsl"
 
 // 每帧更新
 // 由于OpenGL不支持该功能，因此需要使用宏来适配
@@ -37,8 +38,83 @@ CBUFFER_START(_LightBuffer)
 	float4 _VisibleLightSpotDirections[MAX_VISIBLE_LIGHTS];
 CBUFFER_END
 
+// 阴影缓冲
+CBUFFER_START(_ShadowBuffer)
+	float4x4 _WorldToShadowMatrices[MAX_VISIBLE_LIGHTS];
+	float4 _ShadowData[MAX_VISIBLE_LIGHTS];
+	float4 _ShadowMapSize;
+CBUFFER_END
+
+// 纹理资源
+TEXTURE2D_SHADOW(_ShadowMap);
+
+// 采样器
+// 该采样器会在双线性插值之前进行比较操作，结果更准确
+SAMPLER_CMP(sampler_ShadowMap);
+
+// 计算硬阴影
+float HardShadowAttenuation (float4 shadowPos) {
+	return SAMPLE_TEXTURE2D_SHADOW(_ShadowMap, sampler_ShadowMap, shadowPos.xyz);
+}
+
+// 计算软阴影
+float SoftShadowAttenuation(float4 shadowPos) {
+	real tentWeights[9];
+	real2 tentUVs[9];
+	SampleShadow_ComputeSamples_Tent_5x5(
+		_ShadowMapSize, shadowPos.xy, tentWeights, tentUVs
+	);
+	float attenuation = 0;
+	for (int i = 0; i < 9; i++) {
+		attenuation += tentWeights[i] * SAMPLE_TEXTURE2D_SHADOW(
+			_ShadowMap, sampler_ShadowMap, float3(tentUVs[i].xy, shadowPos.z)
+		);
+	}
+	return attenuation;
+}
+
+// 计算阴影
+float ShadowAttenuation(int index, float3 worldPos) {
+
+	// 如果不投射阴影，直接返回1
+#if !defined(_SHADOWS_HARD) && !defined(_SHADOWS_SOFT)
+	return 1.0;
+#endif
+
+	// 如果阴影强度不为正，直接返回1
+	if (_ShadowData[index].x <= 0) {
+		return 1.0;
+	}
+
+	float4 shadowPos = mul(_WorldToShadowMatrices[index], float4(worldPos, 1.0));
+
+	// 我们需要NDC坐标，因此需要除以w分量
+	shadowPos.xyz /= shadowPos.w;
+
+	float attenuation;
+
+	// 根据硬软阴影关键字分类计算
+#if defined(_SHADOWS_HARD)
+	#if defined(_SHADOWS_SOFT)
+		if (_ShadowData[index].y == 0) {
+			attenuation = HardShadowAttenuation(shadowPos);
+		}
+		else {
+			attenuation = SoftShadowAttenuation(shadowPos);
+		}
+	#else
+		attenuation = HardShadowAttenuation(shadowPos);
+	#endif
+#else
+	attenuation = SoftShadowAttenuation(shadowPos);
+#endif
+
+	// 根据阴影强度插值
+	return lerp(1, attenuation, _ShadowData[index].x);
+}
+
 // 计算漫反射光
-float3 DiffuseLight(int index, float3 normal, float3 worldPos) {
+float3 DiffuseLight(int index, float3 normal, float3 worldPos, float shadowAttenuation) {
 
 	float3 lightColor = _VisibleLightColors[index].rgb;
 	float4 lightPositionOrDirection = _VisibleLightDirectionsOrPositions[index];
@@ -68,7 +144,7 @@ float3 DiffuseLight(int index, float3 normal, float3 worldPos) {
 	// 对于方向光，lightVector的模为1，故方向光不受衰减影响
 	float distanceSqr = max(dot(lightVector, lightVector), 0.00001);
 
-	diffuse *= spotFade * rangeFade / distanceSqr;
+	diffuse *= shadowAttenuation * spotFade * rangeFade / distanceSqr;
 
 	return diffuse * lightColor;
 }
@@ -111,11 +187,11 @@ VertexOutput LitPassVertex(VertexInput input) {
 	output.worldPos = worldPos.xyz;
 
 	// 计算顶点光
+	// 顶点光不计算阴影
 	output.vertexLighting = 0;
 	for (int i = 4; i < min(unity_LightIndicesOffsetAndCount.y, 8); i++) {
 		int lightIndex = unity_4LightIndices1[i - 4];
-		output.vertexLighting +=
-			DiffuseLight(lightIndex, output.normal, output.worldPos);
+		output.vertexLighting += DiffuseLight(lightIndex, output.normal, output.worldPos, 1);
 	}
 
 	return output;
@@ -139,7 +215,8 @@ float4 LitPassFragment(VertexOutput input) : SV_TARGET{
 	// 如果循环不是很复杂的话，编译器会将其展开
 	for (int i = 0; i < min(unity_LightIndicesOffsetAndCount.y, 4); i++) {
 		int lightIndex = unity_4LightIndices0[i];
-		diffuseLight += DiffuseLight(lightIndex, input.normal, input.worldPos);
+		float shadowAttenuation = ShadowAttenuation(lightIndex, input.worldPos);
+		diffuseLight += DiffuseLight(lightIndex, input.normal, input.worldPos, shadowAttenuation);
 	}
 
 	float3 color = diffuseLight * albedo;

@@ -60,6 +60,7 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Assets\Editor\LitShaderGUI.cs" />
     <Compile Include="Assets\Editor\MyPipelineAssetEditor.cs" />
     <Reference Include="Unity.RenderPipelines.Core.Editor">
       <HintPath>C:/Users/1/Desktop/Profiler/LearnSRP/Library/ScriptAssemblies/Unity.RenderPipelines.Core.Editor.dll</HintPath>

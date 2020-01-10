@@ -29,6 +29,11 @@ float DistanceToCameraSqr(float3 worldPos) {
 	return dot(cameraToFragment, cameraToFragment);
 }
 
+CBUFFER_START(UnityPerMaterial)
+	float4 _MainTex_ST;
+	float _Cutoff;
+CBUFFER_END
+
 // 定义UNITY_MATRIX_M，保证后续代码的一致性
 #define UNITY_MATRIX_M unity_ObjectToWorld
 // 该文件会重定义UNITY_MATRIX_M，因此必须放在我们自己定义的宏的后面
@@ -69,6 +74,9 @@ SAMPLER_CMP(sampler_ShadowMap);
 TEXTURE2D_SHADOW(_CascadedShadowMap);
 SAMPLER_CMP(sampler_CascadedShadowMap);
 
+TEXTURE2D(_MainTex);
+SAMPLER(sampler_MainTex);
+
 // 计算硬阴影
 float HardShadowAttenuation (float4 shadowPos, bool cascade = false) {
 	if (cascade) {
@@ -96,7 +104,9 @@ float SoftShadowAttenuation(float4 shadowPos, bool cascade = false) {
 float ShadowAttenuation(int index, float3 worldPos) {
 
 	// 如果不投射阴影，直接返回1
-#if !defined(_SHADOWS_HARD) && !defined(_SHADOWS_SOFT)
+#if !defined(_RECEIVE_SHADOWS)
+	return 1.0;
+#elif !defined(_SHADOWS_HARD) && !defined(_SHADOWS_SOFT)
 	return 1.0;
 #endif
 
@@ -151,7 +161,9 @@ float InsideCascadeCullingSphere(int index, float3 worldPos) {
 // 计算层级阴影
 float CascadedShadowAttenuation(float3 worldPos) {
 
-#if !defined(_CASCADED_SHADOWS_HARD) && !defined(_CASCADED_SHADOWS_SOFT)
+#if !defined(_RECEIVE_SHADOWS)
+	return 1.0;
+#elif !defined(_CASCADED_SHADOWS_HARD) && !defined(_CASCADED_SHADOWS_SOFT)
 	return 1.0;
 #endif
 
@@ -236,6 +248,7 @@ float3 MainLight(float3 normal, float3 worldPos) {
 struct VertexInput {
 	float4 pos : POSITION;
 	float3 normal : NORMAL;
+	float2 uv : TEXCOORD0;
 	UNITY_VERTEX_INPUT_INSTANCE_ID // 实例的索引
 };
 
@@ -245,6 +258,7 @@ struct VertexOutput {
 	float3 normal : TEXCOORD0;
 	float3 worldPos : TEXCOORD1;
 	float3 vertexLighting : TEXCOORD2;
+	float2 uv : TEXCOORD3;
 	UNITY_VERTEX_INPUT_INSTANCE_ID // 实例的索引
 };
 
@@ -277,11 +291,13 @@ VertexOutput LitPassVertex(VertexInput input) {
 		output.vertexLighting += DiffuseLight(lightIndex, output.normal, output.worldPos, 1);
 	}
 
+	output.uv = TRANSFORM_TEX(input.uv, _MainTex);
+
 	return output;
 }
 
 // 片段着色器
-float4 LitPassFragment(VertexOutput input) : SV_TARGET{
+float4 LitPassFragment(VertexOutput input, FRONT_FACE_TYPE isFrontFace : FRONT_FACE_SEMANTIC) : SV_TARGET{
 
 	// 使实例索引可见
 	// 必须在UNITY_ACCESS_INSTANCED_PROP之前使用
@@ -290,8 +306,17 @@ float4 LitPassFragment(VertexOutput input) : SV_TARGET{
 	// 法线插值后会丧失单位性
 	input.normal = normalize(input.normal);
 
+	// 渲染背面时要把法向量取反
+	input.normal = IS_FRONT_VFACE(isFrontFace, input.normal, -input.normal);
+
+	float4 albedoAlpha = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, input.uv);
 	// 使用GPU实例化的颜色
-	float3 albedo = UNITY_ACCESS_INSTANCED_PROP(PerInstance, _Color).rgb;
+	albedoAlpha *= UNITY_ACCESS_INSTANCED_PROP(PerInstance, _Color);
+
+	// Clip
+#if defined(_CLIPPING_ON)
+	clip(albedoAlpha.a - _Cutoff);
+#endif
 
 	float3 diffuseLight = input.vertexLighting;
 
@@ -306,8 +331,8 @@ float4 LitPassFragment(VertexOutput input) : SV_TARGET{
 		diffuseLight += DiffuseLight(lightIndex, input.normal, input.worldPos, shadowAttenuation);
 	}
 
-	float3 color = diffuseLight * albedo;
-	return float4(color, 1);
+	float3 color = diffuseLight * albedoAlpha.rgb;
+	return float4(color, albedoAlpha.a);
 }
 
 #endif // MYRP_LIT_INCLUDED

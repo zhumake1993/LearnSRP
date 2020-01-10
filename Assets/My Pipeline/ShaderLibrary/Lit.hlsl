@@ -20,6 +20,15 @@ CBUFFER_START(UnityPerDraw)
 	float4 unity_4LightIndices0, unity_4LightIndices1;
 CBUFFER_END
 
+CBUFFER_START(UnityPerCamera)
+	float3 _WorldSpaceCameraPos;
+CBUFFER_END
+
+float DistanceToCameraSqr(float3 worldPos) {
+	float3 cameraToFragment = worldPos - _WorldSpaceCameraPos;
+	return dot(cameraToFragment, cameraToFragment);
+}
+
 // 定义UNITY_MATRIX_M，保证后续代码的一致性
 #define UNITY_MATRIX_M unity_ObjectToWorld
 // 该文件会重定义UNITY_MATRIX_M，因此必须放在我们自己定义的宏的后面
@@ -41,8 +50,13 @@ CBUFFER_END
 // 阴影缓冲
 CBUFFER_START(_ShadowBuffer)
 	float4x4 _WorldToShadowMatrices[MAX_VISIBLE_LIGHTS];
+	float4x4 _WorldToShadowCascadeMatrices[5];
+	float4 _CascadeCullingSpheres[4];
 	float4 _ShadowData[MAX_VISIBLE_LIGHTS];
 	float4 _ShadowMapSize;
+	float4 _CascadedShadowMapSize;
+	float4 _GlobalShadowData;
+	float _CascadedShadowStrength;
 CBUFFER_END
 
 // 纹理资源
@@ -52,23 +66,28 @@ TEXTURE2D_SHADOW(_ShadowMap);
 // 该采样器会在双线性插值之前进行比较操作，结果更准确
 SAMPLER_CMP(sampler_ShadowMap);
 
+TEXTURE2D_SHADOW(_CascadedShadowMap);
+SAMPLER_CMP(sampler_CascadedShadowMap);
+
 // 计算硬阴影
-float HardShadowAttenuation (float4 shadowPos) {
-	return SAMPLE_TEXTURE2D_SHADOW(_ShadowMap, sampler_ShadowMap, shadowPos.xyz);
+float HardShadowAttenuation (float4 shadowPos, bool cascade = false) {
+	if (cascade) {
+		return SAMPLE_TEXTURE2D_SHADOW(_CascadedShadowMap, sampler_CascadedShadowMap, shadowPos.xyz);
+	}
+	else {
+		return SAMPLE_TEXTURE2D_SHADOW(_ShadowMap, sampler_ShadowMap, shadowPos.xyz);
+	}
 }
 
 // 计算软阴影
-float SoftShadowAttenuation(float4 shadowPos) {
+float SoftShadowAttenuation(float4 shadowPos, bool cascade = false) {
 	real tentWeights[9];
 	real2 tentUVs[9];
-	SampleShadow_ComputeSamples_Tent_5x5(
-		_ShadowMapSize, shadowPos.xy, tentWeights, tentUVs
-	);
+	float4 size = cascade ? _CascadedShadowMapSize : _ShadowMapSize;
+	SampleShadow_ComputeSamples_Tent_5x5(size, shadowPos.xy, tentWeights, tentUVs);
 	float attenuation = 0;
 	for (int i = 0; i < 9; i++) {
-		attenuation += tentWeights[i] * SAMPLE_TEXTURE2D_SHADOW(
-			_ShadowMap, sampler_ShadowMap, float3(tentUVs[i].xy, shadowPos.z)
-		);
+		attenuation += tentWeights[i] * HardShadowAttenuation(float4(tentUVs[i].xy, shadowPos.z, 0), cascade);
 	}
 	return attenuation;
 }
@@ -81,8 +100,8 @@ float ShadowAttenuation(int index, float3 worldPos) {
 	return 1.0;
 #endif
 
-	// 如果阴影强度不为正，直接返回1
-	if (_ShadowData[index].x <= 0) {
+	// 如果阴影强度不为正，或者超过阴影距离，直接返回1
+	if (_ShadowData[index].x <= 0 || DistanceToCameraSqr(worldPos) > _GlobalShadowData.y) {
 		return 1.0;
 	}
 
@@ -90,6 +109,16 @@ float ShadowAttenuation(int index, float3 worldPos) {
 
 	// 我们需要NDC坐标，因此需要除以w分量
 	shadowPos.xyz /= shadowPos.w;
+
+	// 手动clip
+	// 在catlike的教程中，作者暗示聚光不需要这个步骤
+	// 原因是：假设一点在聚光的视角之外，那么其shadowPos.xy会超出[0,1]的范围，导致采样到其他的阴影地图集
+	//         但这不会产生问题，因为不论阴影衰减的计算正确与否，聚光对该点的亮度贡献都是0，因为照不到
+	//         不过，方向光就有问题了，因为方向光范围无限
+	shadowPos.xy = saturate(shadowPos.xy);
+
+	// 计算地图集偏移
+	shadowPos.xy = shadowPos.xy * _GlobalShadowData.x + _ShadowData[index].zw;
 
 	float attenuation;
 
@@ -111,6 +140,50 @@ float ShadowAttenuation(int index, float3 worldPos) {
 
 	// 根据阴影强度插值
 	return lerp(1, attenuation, _ShadowData[index].x);
+}
+
+// 计算位置落在哪一个层级阴影剔除球中
+float InsideCascadeCullingSphere(int index, float3 worldPos) {
+	float4 s = _CascadeCullingSpheres[index];
+	return dot(worldPos - s.xyz, worldPos - s.xyz) < s.w;
+}
+
+// 计算层级阴影
+float CascadedShadowAttenuation(float3 worldPos) {
+
+#if !defined(_CASCADED_SHADOWS_HARD) && !defined(_CASCADED_SHADOWS_SOFT)
+	return 1.0;
+#endif
+
+	if (DistanceToCameraSqr(worldPos) > _GlobalShadowData.y) {
+		return 1.0;
+	}
+
+	float4 cascadeFlags = float4(
+		InsideCascadeCullingSphere(0, worldPos),
+		InsideCascadeCullingSphere(1, worldPos),
+		InsideCascadeCullingSphere(2, worldPos),
+		InsideCascadeCullingSphere(3, worldPos)
+		);
+
+	// 显示层级阴影范围
+	//return dot(cascadeFlags, 0.25);
+	
+	// 计算层级
+	cascadeFlags.yzw = saturate(cascadeFlags.yzw - cascadeFlags.xyz);
+	float cascadeIndex = 4 - dot(cascadeFlags, float4(4, 3, 2, 1));
+
+	float4 shadowPos = mul(
+		_WorldToShadowCascadeMatrices[cascadeIndex], float4(worldPos, 1.0)
+	);
+	float attenuation;
+#if defined(_CASCADED_SHADOWS_HARD)
+	attenuation = HardShadowAttenuation(shadowPos, true);
+#else
+	attenuation = SoftShadowAttenuation(shadowPos, true);
+#endif
+
+	return lerp(1, attenuation, _CascadedShadowStrength);
 }
 
 // 计算漫反射光
@@ -146,6 +219,16 @@ float3 DiffuseLight(int index, float3 normal, float3 worldPos, float shadowAtten
 
 	diffuse *= shadowAttenuation * spotFade * rangeFade / distanceSqr;
 
+	return diffuse * lightColor;
+}
+
+// 计算主光的漫反射光
+float3 MainLight(float3 normal, float3 worldPos) {
+	float shadowAttenuation = CascadedShadowAttenuation(worldPos);
+	float3 lightColor = _VisibleLightColors[0].rgb;
+	float3 lightDirection = _VisibleLightDirectionsOrPositions[0].xyz;
+	float diffuse = saturate(dot(normal, lightDirection));
+	diffuse *= shadowAttenuation;
 	return diffuse * lightColor;
 }
 
@@ -211,6 +294,10 @@ float4 LitPassFragment(VertexOutput input) : SV_TARGET{
 	float3 albedo = UNITY_ACCESS_INSTANCED_PROP(PerInstance, _Color).rgb;
 
 	float3 diffuseLight = input.vertexLighting;
+
+#if defined(_CASCADED_SHADOWS_HARD) || defined(_CASCADED_SHADOWS_SOFT)
+	diffuseLight += MainLight(input.normal, input.worldPos);
+#endif
 
 	// 如果循环不是很复杂的话，编译器会将其展开
 	for (int i = 0; i < min(unity_LightIndicesOffsetAndCount.y, 4); i++) {

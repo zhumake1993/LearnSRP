@@ -23,6 +23,9 @@
 			// 指定均匀缩放，这样实例化缓冲中不会包含从世界空间到对象空间的转换矩阵
 			#pragma instancing_options assumeuniformscaling
 
+			// 是否开启层级阴影，硬阴影，软阴影
+			#pragma multi_compile _ _CASCADED_SHADOWS_HARD _CASCADED_SHADOWS_SOFT
+
 			// 是否开启硬阴影
 			#pragma multi_compile _ _SHADOWS_HARD
 

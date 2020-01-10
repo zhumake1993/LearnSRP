@@ -7,9 +7,9 @@ using Conditional = System.Diagnostics.ConditionalAttribute;
 // 尽管也可以继承接口IRenderPipeline并提供自己的实现，继承RenderPipeline会更方便
 public class MyPipeline : RenderPipeline
 {
-// =============================================================================================================
-// 光
-// =============================================================================================================
+	// =============================================================================================================
+	// 光
+	// =============================================================================================================
 
 	// 最大光数量
 	const int maxVisibleLights = 16;
@@ -33,9 +33,12 @@ public class MyPipeline : RenderPipeline
 	// y分量表示影响物体的光的数量
 	static int lightIndicesOffsetAndCountID = Shader.PropertyToID("unity_LightIndicesOffsetAndCount");
 
-// =============================================================================================================
-// 阴影
-// =============================================================================================================
+	// 是否存在主光（方向光，有阴影，阴影强度为正，开启层级阴影）
+	bool mainLightExists;
+
+	// =============================================================================================================
+	// 阴影
+	// =============================================================================================================
 
 	// 渲染阴影指令缓冲
 	CommandBuffer shadowBuffer = new CommandBuffer
@@ -58,7 +61,7 @@ public class MyPipeline : RenderPipeline
 	// 阴影偏移
 	static int shadowBiasId = Shader.PropertyToID("_ShadowBias");
 
-	// 阴影数据，x分量存阴影的强度，y分量存是否软阴影
+	// 阴影数据，x分量存阴影的强度，y分量存是否软阴影，z分量存是否是方向光
 	static int shadowDataId = Shader.PropertyToID("_ShadowData");
 	Vector4[] shadowData = new Vector4[maxVisibleLights];
 
@@ -69,9 +72,41 @@ public class MyPipeline : RenderPipeline
 	// 阴影子图集的数量
 	int shadowTileCount;
 
-// =============================================================================================================
-// 渲染
-// =============================================================================================================
+	// 阴影距离
+	float shadowDistance;
+
+	// 阴影全局变量，
+	static int globalShadowDataId = Shader.PropertyToID("_GlobalShadowData");
+
+	// 层级阴影
+	int shadowCascades;
+	Vector3 shadowCascadeSplit;
+
+	// 层级阴影纹理
+	static int cascadedShadowMapId = Shader.PropertyToID("_CascadedShadowMap");
+	RenderTexture cascadedShadowMap;
+
+	// 世界空间到层级阴影空间的转换矩阵
+	static int worldToShadowCascadeMatricesId = Shader.PropertyToID("_WorldToShadowCascadeMatrices");
+	Matrix4x4[] worldToShadowCascadeMatrices = new Matrix4x4[5];
+
+	// 层级软硬阴影
+	const string cascadedShadowsHardKeyword = "_CASCADED_SHADOWS_HARD";
+	const string cascadedShadowsSoftKeyword = "_CASCADED_SHADOWS_SOFT";
+
+	// 层级阴影纹理大小
+	static int cascadedShadowMapSizeId = Shader.PropertyToID("_CascadedShadowMapSize");
+
+	// 层级阴影强度
+	static int cascadedShadoStrengthId = Shader.PropertyToID("_CascadedShadowStrength");
+
+	// 层级阴影剔除球
+	static int cascadeCullingSpheresId = Shader.PropertyToID("_CascadeCullingSpheres");
+	Vector4[] cascadeCullingSpheres = new Vector4[4];
+
+	// =============================================================================================================
+	// 渲染
+	// =============================================================================================================
 
 	// 剔除结果
 	CullResults cull;
@@ -88,11 +123,16 @@ public class MyPipeline : RenderPipeline
 	// 绘制设定的标志位
 	DrawRendererFlags drawFlags;
 
-	public MyPipeline(bool dynamicBatching, bool instancing, int shadowMapSize)
+	public MyPipeline(bool dynamicBatching, bool instancing, int shadowMapSize, float shadowDistance, int shadowCascades, Vector3 shadowCascadeSplit)
 	{
 		// Unity默认光强度是在Gamma空间中定义，即使我们工作在线性空间
 		// 我们需要指定Unity将光强度理解为线性空间中的值
 		GraphicsSettings.lightsUseLinearIntensity = true;
+
+		if (SystemInfo.usesReversedZBuffer)
+		{
+			worldToShadowCascadeMatrices[4].m33 = 1f;
+		}
 
 		if (dynamicBatching)
 		{
@@ -107,6 +147,11 @@ public class MyPipeline : RenderPipeline
 		}
 
 		this.shadowMapSize = shadowMapSize;
+
+		this.shadowDistance = shadowDistance;
+
+		this.shadowCascades = shadowCascades;
+		this.shadowCascadeSplit = shadowCascadeSplit;
 	}
 
 	public override void Render(ScriptableRenderContext renderContext, Camera[] cameras)
@@ -131,7 +176,10 @@ public class MyPipeline : RenderPipeline
 			return;
 		}
 
-// 仅在编辑模式下
+		// 设置阴影参数
+		cullingParameters.shadowDistance = Mathf.Min(shadowDistance, camera.farClipPlane);
+
+		// 仅在编辑模式下
 #if UNITY_EDITOR
 		// 仅在渲染场景视图时。否则游戏视图中的UI元素会被渲染两次
 		if (camera.cameraType == CameraType.SceneView)
@@ -148,6 +196,17 @@ public class MyPipeline : RenderPipeline
 		if (cull.visibleLights.Count > 0)
 		{
 			ConfigureLights();
+
+			if (mainLightExists)
+			{
+				RenderCascadedShadows(context);
+			}
+			else
+			{
+				cameraBuffer.DisableShaderKeyword(cascadedShadowsHardKeyword);
+				cameraBuffer.DisableShaderKeyword(cascadedShadowsSoftKeyword);
+			}
+
 			if (shadowTileCount > 0)
 			{
 				RenderShadows(context);
@@ -163,6 +222,8 @@ public class MyPipeline : RenderPipeline
 			// 由于该值会被保留为上一个物体使用的值，因此需要手动设置
 			cameraBuffer.SetGlobalVector(lightIndicesOffsetAndCountID, Vector4.zero);
 
+			cameraBuffer.DisableShaderKeyword(cascadedShadowsHardKeyword);
+			cameraBuffer.DisableShaderKeyword(cascadedShadowsSoftKeyword);
 			cameraBuffer.DisableShaderKeyword(shadowsHardKeyword);
 			cameraBuffer.DisableShaderKeyword(shadowsSoftKeyword);
 		}
@@ -231,11 +292,18 @@ public class MyPipeline : RenderPipeline
 		// 提交指令
 		context.Submit();
 
-		// 释放渲染纹理
+		// 释放阴影纹理
 		if (shadowMap)
 		{
 			RenderTexture.ReleaseTemporary(shadowMap);
 			shadowMap = null;
+		}
+
+		// 释放层级阴影纹理
+		if (cascadedShadowMap)
+		{
+			RenderTexture.ReleaseTemporary(cascadedShadowMap);
+			cascadedShadowMap = null;
 		}
 	}
 
@@ -275,6 +343,8 @@ public class MyPipeline : RenderPipeline
 	// 计算光数据
 	void ConfigureLights()
 	{
+		mainLightExists = false;
+
 		shadowTileCount = 0;
 
 		for (int i = 0; i < cull.visibleLights.Count; i++)
@@ -296,7 +366,6 @@ public class MyPipeline : RenderPipeline
 			// 保证计算聚光灯的边界衰减不会影响其他类型的灯
 			attenuation.w = 1f;
 
-			// 
 			Vector4 shadow = Vector4.zero;
 
 			if (light.lightType == LightType.Directional)
@@ -308,6 +377,18 @@ public class MyPipeline : RenderPipeline
 				v.y = -v.y;
 				v.z = -v.z;
 				visibleLightDirectionsOrPositions[i] = v;
+
+				shadow = ConfigureShadows(i, light.light);
+				shadow.z = 1f; // z分量指示是否处理方向光
+
+				// 如果存在主光
+				if (i == 0 && shadow.x > 0f && shadowCascades > 0)
+				{
+					mainLightExists = true;
+
+					// 层级阴影使用另一张阴影纹理
+					shadowTileCount -= 1;
+				}
 			}
 			else
 			{
@@ -336,18 +417,7 @@ public class MyPipeline : RenderPipeline
 					attenuation.z = 1f / angleRange;
 					attenuation.w = -outerCos * attenuation.z;
 
-					// x分量存阴影的强度
-					// y分量存是否软阴影
-					Light shadowLight = light.light;
-					Bounds shadowBounds;
-					if (shadowLight.shadows != LightShadows.None && cull.GetShadowCasterBounds(i, out shadowBounds))
-					{
-						shadowTileCount += 1;
-
-						// 当阴影发射器和阴影接受器
-						shadow.x = shadowLight.shadowStrength;
-						shadow.y = shadowLight.shadows == LightShadows.Soft ? 1f : 0f;
-					}
+					shadow = ConfigureShadows(i, light.light);
 				}
 			}
 
@@ -357,10 +427,18 @@ public class MyPipeline : RenderPipeline
 		}
 
 		// 如果光的数量超过maxVisibleLights，将超过的灯光的索引剔除掉
-		if (cull.visibleLights.Count > maxVisibleLights)
+		if (mainLightExists || cull.visibleLights.Count > maxVisibleLights)
 		{
 			// 获取光索引数组
 			int[] lightIndices = cull.GetLightIndexMap();
+
+			if (mainLightExists)
+			{
+				// 将主光剔除掉，否则主光会被渲染两次
+				// 这也意味着每个物体支持的像素光的数量变为5
+				lightIndices[0] = -1;
+			}
+
 			for (int i = maxVisibleLights; i < cull.visibleLights.Count; i++)
 			{
 				// 索引为-1的光会被剔除掉
@@ -369,6 +447,21 @@ public class MyPipeline : RenderPipeline
 			// 设置光索引数组
 			cull.SetLightIndexMap(lightIndices);
 		}
+	}
+
+	Vector4 ConfigureShadows(int lightIndex, Light shadowLight)
+	{
+		Vector4 shadow = Vector4.zero;
+		Bounds shadowBounds;
+		if (shadowLight.shadows != LightShadows.None && cull.GetShadowCasterBounds(lightIndex, out shadowBounds))
+		{
+			shadowTileCount += 1;
+
+			// x分量存阴影的强度，y分量存是否软阴影
+			shadow.x = shadowLight.shadowStrength;
+			shadow.y = shadowLight.shadows == LightShadows.Soft ? 1f : 0f;
+		}
+		return shadow;
 	}
 
 	// 绘制ShadowMap
@@ -396,18 +489,14 @@ public class MyPipeline : RenderPipeline
 		// 子图集的大小
 		float tileSize = shadowMapSize / split;
 		float tileScale = 1f / split;
-		Rect tileViewport = new Rect(0f, 0f, tileSize, tileSize);
 
-		// 创建或者复用一个渲染纹理
-		shadowMap = RenderTexture.GetTemporary(shadowMapSize, shadowMapSize, 16, RenderTextureFormat.Shadowmap);
-
-		shadowMap.filterMode = FilterMode.Bilinear;
-		shadowMap.wrapMode = TextureWrapMode.Clamp;
-
-		// 设置渲染目标，设置只清空深度通道
-		CoreUtils.SetRenderTarget(shadowBuffer, shadowMap, RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store, ClearFlag.Depth);
+		shadowMap = SetShadowRenderTarget();
 
 		shadowBuffer.BeginSample("HY Render Shadows");
+
+		// 设置全局变量
+		shadowBuffer.SetGlobalVector(globalShadowDataId, new Vector4(tileScale, shadowDistance * shadowDistance));
+
 		context.ExecuteCommandBuffer(shadowBuffer);
 		shadowBuffer.Clear();
 
@@ -416,7 +505,8 @@ public class MyPipeline : RenderPipeline
 		bool hardShadows = false;
 		bool softShadows = false;
 
-		for (int i = 0; i < cull.visibleLights.Count; i++)
+		// 如果存在主光，需要跳过
+		for (int i = mainLightExists ? 1 : 0; i < cull.visibleLights.Count; i++)
 		{
 			if (i == maxVisibleLights)
 			{
@@ -432,25 +522,29 @@ public class MyPipeline : RenderPipeline
 			// 获取灯的视矩阵和投影矩阵
 			Matrix4x4 viewMatrix, projectionMatrix;
 			ShadowSplitData splitData;
-			if (!cull.ComputeSpotShadowMatricesAndCullingPrimitives(i, out viewMatrix, out projectionMatrix, out splitData))
+			bool validShadows;
+			if (shadowData[i].z > 0f)
+			{
+				validShadows =cull.ComputeDirectionalShadowMatricesAndCullingPrimitives(
+						i, 0, 1, Vector3.right, (int)tileSize,
+						cull.visibleLights[i].light.shadowNearPlane,
+						out viewMatrix, out projectionMatrix, out splitData);
+			}
+			else
+			{
+				validShadows = cull.ComputeSpotShadowMatricesAndCullingPrimitives(i, out viewMatrix, out projectionMatrix, out splitData);
+			}
+			if (!validShadows)
 			{
 				// 获取矩阵失败则强度置0
 				shadowData[i].x = 0f;
 				continue;
 			}
 
-			// 计算视口
-			float tileOffsetX = tileIndex % split;
-			float tileOffsetY = tileIndex / split;
-			tileViewport.x = tileOffsetX * tileSize;
-			tileViewport.y = tileOffsetY * tileSize;
-			if (split > 1)
-			{
-				// 设置视口
-				shadowBuffer.SetViewport(tileViewport);
-				// 使用裁剪，略微减少阴影子图集的大小，防止采样到临近的子图集
-				shadowBuffer.EnableScissorRect(new Rect(tileViewport.x + 4f, tileViewport.y + 4f, tileSize - 8f, tileSize - 8f));
-			}
+			Vector2 tileOffset = ConfigureShadowTile(tileIndex, split, tileSize);
+			// 存储地图集的偏移
+			shadowData[i].z = tileOffset.x * tileScale;
+			shadowData[i].w = tileOffset.y * tileScale;
 			
 			// 设置灯的视矩阵和投影矩阵
 			shadowBuffer.SetViewProjectionMatrices(viewMatrix, projectionMatrix);
@@ -461,32 +555,11 @@ public class MyPipeline : RenderPipeline
 
 			// 绘制阴影
 			var shadowSettings = new DrawShadowsSettings(cull, i);
+			// 设置方向光的剔除球，其他光不受影响
+			shadowSettings.splitData.cullingSphere = splitData.cullingSphere;
 			context.DrawShadows(ref shadowSettings);
 
-			// 计算世界空间到阴影空间的转换矩阵
-			if (SystemInfo.usesReversedZBuffer)
-			{
-				projectionMatrix.m20 = -projectionMatrix.m20;
-				projectionMatrix.m21 = -projectionMatrix.m21;
-				projectionMatrix.m22 = -projectionMatrix.m22;
-				projectionMatrix.m23 = -projectionMatrix.m23;
-			}
-			// 剪裁空间时-1到1，纹理坐标和深度是0到1，因此需要转换。将转换矩阵直接乘到世界空间到阴影空间的转换矩阵中
-			var scaleOffset = Matrix4x4.identity;
-			scaleOffset.m00 = scaleOffset.m11 = scaleOffset.m22 = 0.5f;
-			scaleOffset.m03 = scaleOffset.m13 = scaleOffset.m23 = 0.5f;
-
-			worldToShadowMatrices[i] = scaleOffset * (projectionMatrix * viewMatrix);
-
-			if (split > 1)
-			{
-				// 修改矩阵以采样到正确的子图集
-				var tileMatrix = Matrix4x4.identity;
-				tileMatrix.m00 = tileMatrix.m11 = tileScale;
-				tileMatrix.m03 = tileOffsetX * tileScale;
-				tileMatrix.m13 = tileOffsetY * tileScale;
-				worldToShadowMatrices[i] = tileMatrix * worldToShadowMatrices[i];
-			}
+			CalculateWorldToShadowMatrix(ref viewMatrix, ref projectionMatrix, out worldToShadowMatrices[i]);
 
 			tileIndex += 1;
 
@@ -500,11 +573,8 @@ public class MyPipeline : RenderPipeline
 			}
 		}
 
-		if (split > 1)
-		{
-			// 关闭裁剪
-			shadowBuffer.DisableScissorRect();
-		}
+		// 关闭裁剪
+		shadowBuffer.DisableScissorRect();
 
 		// 设置ShadowMap
 		shadowBuffer.SetGlobalTexture(shadowMapId, shadowMap);
@@ -526,5 +596,114 @@ public class MyPipeline : RenderPipeline
 		shadowBuffer.EndSample("HY Render Shadows");
 		context.ExecuteCommandBuffer(shadowBuffer);
 		shadowBuffer.Clear();
+	}
+
+	// 绘制层级阴影
+	void RenderCascadedShadows(ScriptableRenderContext context)
+	{
+		float tileSize = shadowMapSize / 2;
+		cascadedShadowMap = SetShadowRenderTarget();
+
+		shadowBuffer.BeginSample("HY Render Cascaded Shadows");
+		shadowBuffer.SetGlobalVector(globalShadowDataId, new Vector4(0f, shadowDistance * shadowDistance));
+		context.ExecuteCommandBuffer(shadowBuffer);
+		shadowBuffer.Clear();
+
+		Light shadowLight = cull.visibleLights[0].light;
+		shadowBuffer.SetGlobalFloat(shadowBiasId, shadowLight.shadowBias);
+		var shadowSettings = new DrawShadowsSettings(cull, 0);
+		var tileMatrix = Matrix4x4.identity;
+		tileMatrix.m00 = tileMatrix.m11 = 0.5f;
+
+		for (int i = 0; i < shadowCascades; i++)
+		{
+			Matrix4x4 viewMatrix, projectionMatrix;
+			ShadowSplitData splitData;
+			cull.ComputeDirectionalShadowMatricesAndCullingPrimitives(
+				0, i, shadowCascades, shadowCascadeSplit, (int)tileSize,
+				shadowLight.shadowNearPlane,
+				out viewMatrix, out projectionMatrix, out splitData
+			);
+
+			Vector2 tileOffset = ConfigureShadowTile(i, 2, tileSize);
+			shadowBuffer.SetViewProjectionMatrices(viewMatrix, projectionMatrix);
+			context.ExecuteCommandBuffer(shadowBuffer);
+			shadowBuffer.Clear();
+
+			cascadeCullingSpheres[i] = shadowSettings.splitData.cullingSphere = splitData.cullingSphere;
+			cascadeCullingSpheres[i].w *= splitData.cullingSphere.w;
+			context.DrawShadows(ref shadowSettings);
+
+			CalculateWorldToShadowMatrix(ref viewMatrix, ref projectionMatrix, out worldToShadowCascadeMatrices[i]);
+			tileMatrix.m03 = tileOffset.x * 0.5f;
+			tileMatrix.m13 = tileOffset.y * 0.5f;
+			worldToShadowCascadeMatrices[i] = tileMatrix * worldToShadowCascadeMatrices[i];
+		}
+
+		shadowBuffer.DisableScissorRect();
+		shadowBuffer.SetGlobalTexture(cascadedShadowMapId, cascadedShadowMap);
+		shadowBuffer.SetGlobalVectorArray(cascadeCullingSpheresId, cascadeCullingSpheres);
+		shadowBuffer.SetGlobalMatrixArray(worldToShadowCascadeMatricesId, worldToShadowCascadeMatrices);
+
+		float invShadowMapSize = 1f / shadowMapSize;
+		shadowBuffer.SetGlobalVector(cascadedShadowMapSizeId, new Vector4(invShadowMapSize, invShadowMapSize, shadowMapSize, shadowMapSize));
+		shadowBuffer.SetGlobalFloat(cascadedShadoStrengthId, shadowLight.shadowStrength);
+
+		bool hard = shadowLight.shadows == LightShadows.Hard;
+		CoreUtils.SetKeyword(shadowBuffer, cascadedShadowsHardKeyword, hard);
+		CoreUtils.SetKeyword(shadowBuffer, cascadedShadowsSoftKeyword, !hard);
+
+		shadowBuffer.EndSample("HY Render Cascaded Shadows");
+		context.ExecuteCommandBuffer(shadowBuffer);
+		shadowBuffer.Clear();
+	}
+
+	// 设置渲染目标
+	RenderTexture SetShadowRenderTarget()
+	{
+		// 创建或者复用一个渲染纹理
+		RenderTexture texture = RenderTexture.GetTemporary(shadowMapSize, shadowMapSize, 16, RenderTextureFormat.Shadowmap);
+
+		texture.filterMode = FilterMode.Bilinear;
+		texture.wrapMode = TextureWrapMode.Clamp;
+
+		// 设置渲染目标，设置只清空深度通道
+		CoreUtils.SetRenderTarget(shadowBuffer, texture,RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store,ClearFlag.Depth);
+
+		return texture;
+	}
+
+	// 计算阴影地图集参数
+	Vector2 ConfigureShadowTile(int tileIndex, int split, float tileSize)
+	{
+		// 计算视口
+		Vector2 tileOffset;
+		tileOffset.x = tileIndex % split;
+		tileOffset.y = tileIndex / split;
+		// 设置视口
+		var tileViewport = new Rect(tileOffset.x * tileSize, tileOffset.y * tileSize, tileSize, tileSize);
+		shadowBuffer.SetViewport(tileViewport);
+		// 使用裁剪，略微减少阴影子图集的大小，防止采样到临近的子图集
+		shadowBuffer.EnableScissorRect(new Rect(tileViewport.x + 4f, tileViewport.y + 4f,tileSize - 8f, tileSize - 8f));
+
+		return tileOffset;
+	}
+
+	// 世界空间到阴影空间的转换矩阵
+	void CalculateWorldToShadowMatrix(ref Matrix4x4 viewMatrix, ref Matrix4x4 projectionMatrix,out Matrix4x4 worldToShadowMatrix)
+	{
+		if (SystemInfo.usesReversedZBuffer)
+		{
+			projectionMatrix.m20 = -projectionMatrix.m20;
+			projectionMatrix.m21 = -projectionMatrix.m21;
+			projectionMatrix.m22 = -projectionMatrix.m22;
+			projectionMatrix.m23 = -projectionMatrix.m23;
+		}
+		// 剪裁空间时-1到1，纹理坐标和深度是0到1，因此需要转换。将转换矩阵直接乘到世界空间到阴影空间的转换矩阵中
+		var scaleOffset = Matrix4x4.identity;
+		scaleOffset.m00 = scaleOffset.m11 = scaleOffset.m22 = 0.5f;
+		scaleOffset.m03 = scaleOffset.m13 = scaleOffset.m23 = 0.5f;
+
+		worldToShadowMatrix = scaleOffset * (projectionMatrix * viewMatrix);
 	}
 }

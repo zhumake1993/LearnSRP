@@ -60,12 +60,14 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Assets\InstancedColor.cs" />
+    <Compile Include="Assets\InstancedMaterialProperties.cs" />
     <Compile Include="Assets\My Pipeline\MyPipeline.cs" />
     <Compile Include="Assets\My Pipeline\MyPipelineAsset.cs" />
     <None Include="Assets\My Pipeline\ShaderLibrary\ShadowCaster.hlsl" />
     <None Include="Assets\My Pipeline\ShaderLibrary\Unlit.hlsl" />
     <None Include="Assets\My Pipeline\Shaders\Unlit.shader" />
+    <None Include="Assets\My Pipeline\ShaderLibrary\Meta.hlsl" />
+    <None Include="Assets\My Pipeline\ShaderLibrary\Lighting.hlsl" />
     <None Include="Assets\My Pipeline\Shaders\Lit.shader" />
     <None Include="Assets\My Pipeline\ShaderLibrary\Lit.hlsl" />
     <Reference Include="Unity.RenderPipelines.Core.Editor">

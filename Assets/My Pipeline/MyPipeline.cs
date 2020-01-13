@@ -254,12 +254,14 @@ public class MyPipeline : RenderPipeline
 		{
 			flags = drawFlags
 		};
-		// 尽在有可见光时设置，否则Unity会崩溃
+		// 仅在有可见光时设置，否则Unity会崩溃
 		if (cull.visibleLights.Count > 0)
 		{
 			// 指定Unity为每个物体传输光索引数据
 			drawSettings.rendererConfiguration = RendererConfiguration.PerObjectLightIndices8;
 		}
+		// 指定使用反射探针，如果场景中没有反射探针，则使用天空球的立方体贴图
+		drawSettings.rendererConfiguration |= RendererConfiguration.PerObjectReflectionProbes | RendererConfiguration.PerObjectLightmaps;
 		// 指定排序，从前往后
 		drawSettings.sorting.flags = SortFlags.CommonOpaque;
 

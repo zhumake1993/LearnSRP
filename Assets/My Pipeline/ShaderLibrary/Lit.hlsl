@@ -6,6 +6,9 @@
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Shadow/ShadowSamplingTent.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/ImageBasedLighting.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/EntityLighting.hlsl"
+#include "Lighting.hlsl"
 
 // 每帧更新
 // 由于OpenGL不支持该功能，因此需要使用宏来适配
@@ -15,9 +18,14 @@ CBUFFER_END
 
 // 每个Draw Call更新
 CBUFFER_START(UnityPerDraw)
-	float4x4 unity_ObjectToWorld;
+	float4x4 unity_ObjectToWorld, unity_WorldToObject;
 	float4 unity_LightIndicesOffsetAndCount; // y分量表示影响物体的光的数量
 	float4 unity_4LightIndices0, unity_4LightIndices1;
+	float4 unity_SpecCube0_BoxMin, unity_SpecCube0_BoxMax;
+	float4 unity_SpecCube0_ProbePosition, unity_SpecCube0_HDR;
+	float4 unity_SpecCube1_BoxMin, unity_SpecCube1_BoxMax;
+	float4 unity_SpecCube1_ProbePosition, unity_SpecCube1_HDR;
+	float4 unity_LightmapST;
 CBUFFER_END
 
 CBUFFER_START(UnityPerCamera)
@@ -36,12 +44,15 @@ CBUFFER_END
 
 // 定义UNITY_MATRIX_M，保证后续代码的一致性
 #define UNITY_MATRIX_M unity_ObjectToWorld
+#define UNITY_MATRIX_I_M unity_WorldToObject
 // 该文件会重定义UNITY_MATRIX_M，因此必须放在我们自己定义的宏的后面
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/UnityInstancing.hlsl"
 
 // GPU实例化常量缓冲
 UNITY_INSTANCING_BUFFER_START(PerInstance)
 	UNITY_DEFINE_INSTANCED_PROP(float4, _Color) // 当实例化未开启时，等价于float4 _Color
+	UNITY_DEFINE_INSTANCED_PROP(float, _Metallic)
+	UNITY_DEFINE_INSTANCED_PROP(float, _Smoothness)
 UNITY_INSTANCING_BUFFER_END(PerInstance)
 
 // 光数据数组
@@ -76,6 +87,64 @@ SAMPLER_CMP(sampler_CascadedShadowMap);
 
 TEXTURE2D(_MainTex);
 SAMPLER(sampler_MainTex);
+
+TEXTURE2D(unity_Lightmap);
+SAMPLER(samplerunity_Lightmap);
+
+// 采样光照贴图
+float3 SampleLightmap(float2 uv) {
+	return SampleSingleLightmap(
+		TEXTURE2D_PARAM(unity_Lightmap, samplerunity_Lightmap), uv,
+		float4(1, 1, 0, 0),
+#if defined(UNITY_LIGHTMAP_FULL_HDR)
+		false,
+#else
+		true,
+#endif
+		float4(LIGHTMAP_HDR_MULTIPLIER, LIGHTMAP_HDR_EXPONENT, 0.0, 0.0)
+	);
+}
+
+// 立方体投影
+float3 BoxProjection(float3 direction, float3 position, float4 cubemapPosition, float4 boxMin, float4 boxMax) {
+	UNITY_BRANCH
+		if (cubemapPosition.w > 0) {
+			float3 factors =
+				((direction > 0 ? boxMax.xyz : boxMin.xyz) - position) / direction;
+			float scalar = min(min(factors.x, factors.y), factors.z);
+			direction = direction * scalar + (position - cubemapPosition.xyz);
+		}
+	return direction;
+}
+
+// 采样天空球的立方体贴图
+float3 SampleEnvironment(LitSurface s) {
+	float3 reflectVector = reflect(-s.viewDir, s.normal);
+	float mip = PerceptualRoughnessToMipmapLevel(s.perceptualRoughness);
+
+	float3 uvw = BoxProjection(reflectVector, s.position, unity_SpecCube0_ProbePosition, unity_SpecCube0_BoxMin, unity_SpecCube0_BoxMax);
+
+	float4 sample = SAMPLE_TEXTURECUBE_LOD(
+		unity_SpecCube0, samplerunity_SpecCube0, uvw, mip
+	);
+
+	float3 color = DecodeHDREnvironment(sample, unity_SpecCube0_HDR);
+
+	float blend = unity_SpecCube0_BoxMin.w;
+	if (blend < 0.99999) {
+		uvw = BoxProjection(
+			reflectVector, s.position,
+			unity_SpecCube1_ProbePosition,
+			unity_SpecCube1_BoxMin, unity_SpecCube1_BoxMax
+		);
+		sample = SAMPLE_TEXTURECUBE_LOD(
+			unity_SpecCube1, samplerunity_SpecCube0, uvw, mip
+		);
+		color = lerp(DecodeHDREnvironment(sample, unity_SpecCube1_HDR), color, blend);
+	}
+
+	return color;
+}
 
 // 计算硬阴影
 float HardShadowAttenuation (float4 shadowPos, bool cascade = false) {
@@ -198,8 +267,8 @@ float CascadedShadowAttenuation(float3 worldPos) {
 	return lerp(1, attenuation, _CascadedShadowStrength);
 }
 
-// 计算漫反射光
-float3 DiffuseLight(int index, float3 normal, float3 worldPos, float shadowAttenuation) {
+// 计算光
+float3 GenericLight(int index, LitSurface s, float shadowAttenuation) {
 
 	float3 lightColor = _VisibleLightColors[index].rgb;
 	float4 lightPositionOrDirection = _VisibleLightDirectionsOrPositions[index];
@@ -208,11 +277,11 @@ float3 DiffuseLight(int index, float3 normal, float3 worldPos, float shadowAtten
 
 	// 如果是方向光，lightPositionOrDirection.w是0
 	// 如果是点光，lightPositionOrDirection.w是1
-	float3 lightVector = lightPositionOrDirection.xyz - worldPos * lightPositionOrDirection.w;
+	float3 lightVector = lightPositionOrDirection.xyz - s.position * lightPositionOrDirection.w;
 
-	// 兰伯特余弦定理
+	// 计算光
 	float3 lightDirection = normalize(lightVector);
-	float diffuse = saturate(dot(normal, lightDirection));
+	float3 color = LightSurface(s, lightDirection);
 
 	// 计算点光的边界衰减
 	// 对于方向光，lightAttenuation.x为0，故方向光不受边界衰减影响
@@ -229,19 +298,19 @@ float3 DiffuseLight(int index, float3 normal, float3 worldPos, float shadowAtten
 	// 对于方向光，lightVector的模为1，故方向光不受衰减影响
 	float distanceSqr = max(dot(lightVector, lightVector), 0.00001);
 
-	diffuse *= shadowAttenuation * spotFade * rangeFade / distanceSqr;
+	color *= shadowAttenuation * spotFade * rangeFade / distanceSqr;
 
-	return diffuse * lightColor;
+	return color * lightColor;
 }
 
-// 计算主光的漫反射光
-float3 MainLight(float3 normal, float3 worldPos) {
-	float shadowAttenuation = CascadedShadowAttenuation(worldPos);
+// 计算主光
+float3 MainLight(LitSurface s) {
+	float shadowAttenuation = CascadedShadowAttenuation(s.position);
 	float3 lightColor = _VisibleLightColors[0].rgb;
 	float3 lightDirection = _VisibleLightDirectionsOrPositions[0].xyz;
-	float diffuse = saturate(dot(normal, lightDirection));
-	diffuse *= shadowAttenuation;
-	return diffuse * lightColor;
+	float3 color = LightSurface(s, lightDirection);
+	color *= shadowAttenuation;
+	return color * lightColor;
 }
 
 // 顶点着色器输入
@@ -249,6 +318,7 @@ struct VertexInput {
 	float4 pos : POSITION;
 	float3 normal : NORMAL;
 	float2 uv : TEXCOORD0;
+	float2 lightmapUV : TEXCOORD1;
 	UNITY_VERTEX_INPUT_INSTANCE_ID // 实例的索引
 };
 
@@ -259,8 +329,18 @@ struct VertexOutput {
 	float3 worldPos : TEXCOORD1;
 	float3 vertexLighting : TEXCOORD2;
 	float2 uv : TEXCOORD3;
+#if defined(LIGHTMAP_ON)
+	float2 lightmapUV : TEXCOORD4;
+#endif
 	UNITY_VERTEX_INPUT_INSTANCE_ID // 实例的索引
 };
+
+float3 GlobalIllumination(VertexOutput input) {
+#if defined(LIGHTMAP_ON)
+	return SampleLightmap(input.lightmapUV);
+#endif
+	return 0;
+}
 
 // 顶点着色器
 VertexOutput LitPassVertex(VertexInput input) {
@@ -278,20 +358,28 @@ VertexOutput LitPassVertex(VertexInput input) {
 	float4 worldPos = mul(UNITY_MATRIX_M, float4(input.pos.xyz, 1.0));
 	output.clipPos = mul(unity_MatrixVP, worldPos);
 
-	// 因为假定均匀缩放，因此不需要使用逆转置矩阵
+#if defined(UNITY_ASSUME_UNIFORM_SCALING)
 	output.normal = mul((float3x3)UNITY_MATRIX_M, input.normal);
+#else
+	output.normal = normalize(mul(input.normal, (float3x3)UNITY_MATRIX_I_M));
+#endif
 
 	output.worldPos = worldPos.xyz;
 
 	// 计算顶点光
 	// 顶点光不计算阴影
+	LitSurface surface = GetLitSurfaceVertex(output.normal, output.worldPos);
 	output.vertexLighting = 0;
 	for (int i = 4; i < min(unity_LightIndicesOffsetAndCount.y, 8); i++) {
 		int lightIndex = unity_4LightIndices1[i - 4];
-		output.vertexLighting += DiffuseLight(lightIndex, output.normal, output.worldPos, 1);
+		output.vertexLighting += GenericLight(lightIndex, surface, 1);
 	}
 
 	output.uv = TRANSFORM_TEX(input.uv, _MainTex);
+
+#if defined(LIGHTMAP_ON)
+	output.lightmapUV = input.lightmapUV * unity_LightmapST.xy + unity_LightmapST.zw;
+#endif
 
 	return output;
 }
@@ -318,20 +406,32 @@ float4 LitPassFragment(VertexOutput input, FRONT_FACE_TYPE isFrontFace : FRONT_F
 	clip(albedoAlpha.a - _Cutoff);
 #endif
 
-	float3 diffuseLight = input.vertexLighting;
+	// 获取表面数据
+	float3 viewDir = normalize(_WorldSpaceCameraPos - input.worldPos.xyz);
+	LitSurface surface = GetLitSurface(input.normal, input.worldPos, viewDir, albedoAlpha.rgb, UNITY_ACCESS_INSTANCED_PROP(PerInstance, _Metallic), UNITY_ACCESS_INSTANCED_PROP(PerInstance, _Smoothness));
+
+#if defined(_PREMULTIPLY_ALPHA)
+	PremultiplyAlpha(surface, albedoAlpha.a);
+#endif
+
+	float3 color = input.vertexLighting * surface.diffuse;
 
 #if defined(_CASCADED_SHADOWS_HARD) || defined(_CASCADED_SHADOWS_SOFT)
-	diffuseLight += MainLight(input.normal, input.worldPos);
+	color += MainLight(surface);
 #endif
 
 	// 如果循环不是很复杂的话，编译器会将其展开
 	for (int i = 0; i < min(unity_LightIndicesOffsetAndCount.y, 4); i++) {
 		int lightIndex = unity_4LightIndices0[i];
 		float shadowAttenuation = ShadowAttenuation(lightIndex, input.worldPos);
-		diffuseLight += DiffuseLight(lightIndex, input.normal, input.worldPos, shadowAttenuation);
+		color += GenericLight(lightIndex, surface, shadowAttenuation);
 	}
 
-	float3 color = diffuseLight * albedoAlpha.rgb;
+	color += ReflectEnvironment(surface, SampleEnvironment(surface));
+	
+	//color = GlobalIllumination(input);
+	color += GlobalIllumination(input) * surface.diffuse;
+
 	return float4(color, albedoAlpha.a);
 }
 

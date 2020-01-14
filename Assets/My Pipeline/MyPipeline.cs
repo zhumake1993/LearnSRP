@@ -123,7 +123,18 @@ public class MyPipeline : RenderPipeline
 	// 绘制设定的标志位
 	DrawRendererFlags drawFlags;
 
-	public MyPipeline(bool dynamicBatching, bool instancing, int shadowMapSize, float shadowDistance, int shadowCascades, Vector3 shadowCascadeSplit)
+	// 后处理
+	MyPostProcessingStack defaultStack;
+
+	CommandBuffer postProcessingBuffer = new CommandBuffer
+	{
+		name = "Post-Processing"
+	};
+
+	static int cameraColorTextureId = Shader.PropertyToID("_CameraColorTexture");
+	static int cameraDepthTextureId = Shader.PropertyToID("_CameraDepthTexture");
+
+	public MyPipeline(bool dynamicBatching, bool instancing, MyPostProcessingStack defaultStack, int shadowMapSize, float shadowDistance, int shadowCascades, Vector3 shadowCascadeSplit)
 	{
 		// Unity默认光强度是在Gamma空间中定义，即使我们工作在线性空间
 		// 我们需要指定Unity将光强度理解为线性空间中的值
@@ -145,6 +156,8 @@ public class MyPipeline : RenderPipeline
 			// 如果同时开启动态批处理，Unity优先使用GPU实例化
 			drawFlags |= DrawRendererFlags.EnableInstancing;
 		}
+
+		this.defaultStack = defaultStack;
 
 		this.shadowMapSize = shadowMapSize;
 
@@ -231,6 +244,18 @@ public class MyPipeline : RenderPipeline
 		// 设置unity_MatrixVP，以及一些其他属性
 		context.SetupCameraProperties(camera);
 
+		// 获取摄像机的定制后处理栈
+		var myPipelineCamera = camera.GetComponent<MyPipelineCamera>();
+		MyPostProcessingStack activeStack = myPipelineCamera ? myPipelineCamera.PostProcessingStack : defaultStack;
+
+		// 获取并设置渲染目标，用于后处理
+		if (activeStack)
+		{
+			cameraBuffer.GetTemporaryRT(cameraColorTextureId, camera.pixelWidth, camera.pixelHeight, 0, FilterMode.Bilinear);
+			cameraBuffer.GetTemporaryRT(cameraDepthTextureId, camera.pixelWidth, camera.pixelHeight, 24, FilterMode.Point, RenderTextureFormat.Depth);
+			cameraBuffer.SetRenderTarget(cameraColorTextureId,RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store,cameraDepthTextureId,RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store);
+		}
+
 		// 清空
 		CameraClearFlags clearFlags = camera.clearFlags;
 		cameraBuffer.ClearRenderTarget((clearFlags & CameraClearFlags.Depth) != 0, (clearFlags & CameraClearFlags.Color) != 0, camera.backgroundColor);
@@ -279,6 +304,26 @@ public class MyPipeline : RenderPipeline
 		// camera参数仅用来判断是否绘制天空盒（根据camera的清空标志位）
 		context.DrawSkybox(camera);
 
+		// 后处理
+		if (activeStack)
+		{
+			activeStack.RenderAfterOpaque(
+				postProcessingBuffer, cameraColorTextureId, cameraDepthTextureId,
+				camera.pixelWidth, camera.pixelHeight
+			);
+			context.ExecuteCommandBuffer(postProcessingBuffer);
+			postProcessingBuffer.Clear();
+
+			cameraBuffer.SetRenderTarget(
+				cameraColorTextureId,
+				RenderBufferLoadAction.Load, RenderBufferStoreAction.Store,
+				cameraDepthTextureId,
+				RenderBufferLoadAction.Load, RenderBufferStoreAction.Store
+			);
+			context.ExecuteCommandBuffer(cameraBuffer);
+			cameraBuffer.Clear();
+		}
+
 		// 指定排序，从后往前
 		drawSettings.sorting.flags = SortFlags.CommonTransparent;
 		// 绘制透明物体，渲染队列为[2501，5000]
@@ -286,6 +331,16 @@ public class MyPipeline : RenderPipeline
 		context.DrawRenderers(cull.visibleRenderers, ref drawSettings, filterSettings);
 
 		DrawDefaultPipeline(context, camera);
+
+		// 后处理
+		if (activeStack)
+		{
+			activeStack.RenderAfterTransparent(postProcessingBuffer, cameraColorTextureId, cameraDepthTextureId, camera.pixelWidth, camera.pixelHeight);
+			context.ExecuteCommandBuffer(postProcessingBuffer);
+			postProcessingBuffer.Clear();
+			cameraBuffer.ReleaseTemporaryRT(cameraColorTextureId);
+			cameraBuffer.ReleaseTemporaryRT(cameraDepthTextureId);
+		}
 
 		cameraBuffer.EndSample("HY Render Camera");
 		context.ExecuteCommandBuffer(cameraBuffer);

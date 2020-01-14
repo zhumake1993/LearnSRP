@@ -45,10 +45,13 @@ public class MyPipelineAsset : RenderPipelineAsset
 	[SerializeField, HideInInspector]
 	Vector3 fourCascadesSplit = new Vector3(0.067f, 0.2f, 0.467f);
 
+	[SerializeField]
+	MyPostProcessingStack defaultStack = null;
+
 	protected override IRenderPipeline InternalCreatePipeline()
 	{
 		Vector3 shadowCascadeSplit = shadowCascades == ShadowCascades.Four ? fourCascadesSplit : new Vector3(twoCascadesSplit, 0f);
 
-		return new MyPipeline(dynamicBatching, instancing, (int)shadowMapSize, shadowDistance, (int)shadowCascades, shadowCascadeSplit);
+		return new MyPipeline(dynamicBatching, instancing, defaultStack, (int)shadowMapSize, shadowDistance, (int)shadowCascades, shadowCascadeSplit);
 	}
 }

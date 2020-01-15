@@ -13,6 +13,9 @@ public class MyPipelineAsset : RenderPipelineAsset
 	[SerializeField]
 	bool instancing;
 
+	[SerializeField, Range(0.25f, 2f)]
+	float renderScale = 1f;
+
 	// 在Editor中显示的时候会自动去掉前面的下划线
 	public enum ShadowMapSize
 	{
@@ -48,10 +51,24 @@ public class MyPipelineAsset : RenderPipelineAsset
 	[SerializeField]
 	MyPostProcessingStack defaultStack = null;
 
+	public enum MSAAMode
+	{
+		Off = 1,
+		_2x = 2,
+		_4x = 4,
+		_8x = 8
+	}
+
+	[SerializeField]
+	MSAAMode MSAA = MSAAMode.Off;
+
+	[SerializeField]
+	bool allowHDR;
+
 	protected override IRenderPipeline InternalCreatePipeline()
 	{
 		Vector3 shadowCascadeSplit = shadowCascades == ShadowCascades.Four ? fourCascadesSplit : new Vector3(twoCascadesSplit, 0f);
 
-		return new MyPipeline(dynamicBatching, instancing, defaultStack, (int)shadowMapSize, shadowDistance, (int)shadowCascades, shadowCascadeSplit);
+		return new MyPipeline(dynamicBatching, instancing, defaultStack, (int)shadowMapSize, shadowDistance, (int)shadowCascades, shadowCascadeSplit, renderScale, (int)MSAA, allowHDR);
 	}
 }

@@ -14,6 +14,8 @@ SAMPLER(sampler_DepthTex);
 float4 _ProjectionParams;
 float4 _ZBufferParams;
 
+float _ReinhardModifier;
+
 struct VertexInput {
 	float4 pos : POSITION;
 };
@@ -58,6 +60,7 @@ float4 DepthStripesPassFragment(VertexOutput input) : SV_TARGET{
 	// 使用SAMPLE_DEPTH_TEXTURE保证平台兼容性
 	float rawDepth = SAMPLE_DEPTH_TEXTURE(_DepthTex, sampler_DepthTex, input.uv);
 
+	// 注意，是到近平面的距离，不是到摄像机的距离！
 	float depth = LinearEyeDepth(rawDepth, _ZBufferParams);
 	float4 color = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, input.uv);
 
@@ -72,6 +75,12 @@ float4 DepthStripesPassFragment(VertexOutput input) : SV_TARGET{
 	}
 
 	return color;
+}
+
+float4 ToneMappingPassFragment(VertexOutput input) : SV_TARGET{
+	float3 color = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, input.uv).rgb;
+	color *= (1 + color * _ReinhardModifier) / (1 + color);
+	return float4(saturate(color), 1);
 }
 
 #endif // MYRP_POST_EFFECT_STACK_INCLUDED

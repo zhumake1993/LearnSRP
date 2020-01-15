@@ -69,6 +69,7 @@
     <None Include="Assets\My Pipeline\ShaderLibrary\ShadowCaster.hlsl" />
     <None Include="Assets\My Pipeline\ShaderLibrary\Unlit.hlsl" />
     <None Include="Assets\My Pipeline\Shaders\Unlit.shader" />
+    <None Include="Assets\My Pipeline\ShaderLibrary\DepthOnly.hlsl" />
     <None Include="Assets\My Pipeline\ShaderLibrary\Meta.hlsl" />
     <None Include="Assets\My Pipeline\ShaderLibrary\Lighting.hlsl" />
     <None Include="Assets\My Pipeline\Shaders\PostEffectStack.shader" />

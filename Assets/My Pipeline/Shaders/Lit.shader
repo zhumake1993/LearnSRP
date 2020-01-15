@@ -103,6 +103,33 @@
 
 		//	ENDHLSL
 		//}
+
+		Pass {
+			Tags {
+				"LightMode" = "DepthOnly"
+			}
+
+			ColorMask 0
+			Cull[_Cull]
+			ZWrite On
+
+			HLSLPROGRAM
+
+			#pragma target 3.5
+
+			#pragma multi_compile_instancing
+			//#pragma instancing_options assumeuniformscaling
+
+			#pragma shader_feature _CLIPPING_ON
+			#pragma multi_compile _ LOD_FADE_CROSSFADE
+
+			#pragma vertex DepthOnlyPassVertex
+			#pragma fragment DepthOnlyPassFragment
+
+			#include "../ShaderLibrary/DepthOnly.hlsl"
+
+			ENDHLSL
+		}
 	}
 
 	CustomEditor "LitShaderGUI"
